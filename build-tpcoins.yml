@@ -1,0 +1,1153 @@
+name: Build TpCoins
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-tpcoins.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Create sources
+        run: |
+          set -e
+          mkdir -p "$(dirname 'TpCoins/pom.xml')"
+          cat > 'TpCoins/pom.xml' << 'TPCOINS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+
+              <groupId>tpcoins</groupId>
+              <artifactId>TpCoins</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>TpCoins-${project.version}</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/TpCoins.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/TpCoins.java' << 'TPCOINS_EOF'
+          package tpcoins;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.SimpleCommandMap;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.plugin.PluginBase;
+          import tpcoins.command.EconomyCommands;
+          import tpcoins.command.TeleportCommands;
+          import tpcoins.economy.EconomyManager;
+          import tpcoins.teleport.TeleportManager;
+          import tpcoins.util.Messages;
+
+          /**
+           * TpCoins: телепорт-запросы (/tpa, /tpc, /tph, /tp, /tpk) и скелет экономики на монетах
+           * (/pay, /topm, /givem, /dellm, /chekm). Для других плагинов: getEconomy().
+           */
+          public class TpCoins extends PluginBase implements Listener {
+
+              private Messages messages;
+              private EconomyManager economy;
+              private TeleportManager teleports;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  messages = new Messages(getConfig());
+                  economy = new EconomyManager(this);
+                  teleports = new TeleportManager(this);
+
+                  // Встроенный /tp заменяем своим (с правом tpcoins.tp)
+                  SimpleCommandMap map = getServer().getCommandMap();
+                  map.getCommands().remove("tp");
+                  map.getCommands().remove("teleport");
+
+                  TeleportCommands.register(this);
+                  EconomyCommands.register(this);
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      economy.ensureAccount(p);
+                  }
+                  getLogger().info("TpCoins включён.");
+              }
+
+              @Override
+              public void onDisable() {
+                  if (economy != null) {
+                      economy.save();
+                  }
+              }
+
+              public void registerCommand(Command command) {
+                  getServer().getCommandMap().register("tpcoins", command);
+              }
+
+              public Messages getMessages() {
+                  return messages;
+              }
+
+              /** API экономики для других плагинов. */
+              public EconomyManager getEconomy() {
+                  return economy;
+              }
+
+              public TeleportManager getTeleports() {
+                  return teleports;
+              }
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent event) {
+                  economy.ensureAccount(event.getPlayer());
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent event) {
+                  teleports.clear(event.getPlayer());
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/command/Cmd.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/command/Cmd.java' << 'TPCOINS_EOF'
+          package tpcoins.command;
+
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+
+          /** Короткая обёртка: команда = имя + право + лямбда. */
+          public final class Cmd extends Command {
+
+              public interface Handler {
+                  void run(CommandSender sender, String[] args);
+              }
+
+              private final Handler handler;
+
+              public Cmd(String name, String description, String usage, String permission, Handler handler) {
+                  super(name, description, usage);
+                  this.setPermission(permission);
+                  this.handler = handler;
+              }
+
+              @Override
+              public boolean execute(CommandSender sender, String label, String[] args) {
+                  if (!this.testPermission(sender)) {
+                      return false;
+                  }
+                  handler.run(sender, args);
+                  return true;
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/command/EconomyCommands.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/command/EconomyCommands.java' << 'TPCOINS_EOF'
+          package tpcoins.command;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.CommandSender;
+          import tpcoins.TpCoins;
+          import tpcoins.economy.EconomyManager;
+          import tpcoins.economy.EconomyManager.Result;
+          import tpcoins.util.Messages;
+          import tpcoins.util.Players;
+
+          import java.util.List;
+
+          /** /pay /topm /givem /dellm /chekm */
+          public final class EconomyCommands {
+
+              private EconomyCommands() {
+              }
+
+              public static void register(TpCoins plugin) {
+                  final Messages m = plugin.getMessages();
+                  final EconomyManager eco = plugin.getEconomy();
+
+                  plugin.registerCommand(new Cmd("pay", "Перевести монеты игроку", "/pay <ник> <сумма>", "tpcoins.pay",
+                          (sender, a) -> {
+                              if (!(sender instanceof Player)) {
+                                  sender.sendMessage(m.get("only-player"));
+                                  return;
+                              }
+                              Player p = (Player) sender;
+                              if (a.length < 2) {
+                                  sender.sendMessage(m.get("usage", "usage", "/pay <ник> <сумма>"));
+                                  return;
+                              }
+                              long amount = Players.parseAmount(a[1]);
+                              if (amount <= 0) {
+                                  sender.sendMessage(m.get("invalid-amount"));
+                                  return;
+                              }
+                              String fromKey = Players.norm(p.getName());
+                              String toKey = Players.norm(a[0]);
+                              Result r = eco.transfer(fromKey, toKey, amount);
+                              String toName = eco.getName(toKey);
+                              switch (r) {
+                                  case OK:
+                                      String amt = String.valueOf(amount);
+                                      p.sendMessage(m.get("pay-sent", "player", toName, "amount", amt,
+                                              "balance", String.valueOf(eco.getBalance(fromKey))));
+                                      Player target = Players.findExact(plugin.getServer(), toKey);
+                                      if (target != null) {
+                                          target.sendMessage(m.get("pay-received", "player", p.getName(), "amount", amt,
+                                                  "balance", String.valueOf(eco.getBalance(toKey))));
+                                      }
+                                      break;
+                                  case SAME_ACCOUNT:
+                                      sender.sendMessage(m.get("pay-self"));
+                                      break;
+                                  case NOT_ENOUGH:
+                                      sender.sendMessage(m.get("pay-not-enough"));
+                                      break;
+                                  case OVER_LIMIT:
+                                      sender.sendMessage(m.get("pay-target-limit", "player", toName,
+                                              "room", String.valueOf(eco.getRoom(toKey))));
+                                      break;
+                                  default:
+                                      sender.sendMessage(m.get("no-account"));
+                                      break;
+                              }
+                          }));
+
+                  plugin.registerCommand(new Cmd("topm", "Топ богатых игроков", "/topm", "tpcoins.topm",
+                          (sender, a) -> {
+                              int size = Math.max(1, plugin.getConfig().getInt("top-size", 10));
+                              List<EconomyManager.Account> top = eco.top(size);
+                              if (top.isEmpty()) {
+                                  sender.sendMessage(m.get("top-empty"));
+                                  return;
+                              }
+                              sender.sendMessage(m.get("top-header"));
+                              for (int i = 0; i < top.size(); i++) {
+                                  EconomyManager.Account acc = top.get(i);
+                                  sender.sendMessage(m.get("top-line", "n", String.valueOf(i + 1),
+                                          "player", acc.getName(), "amount", String.valueOf(acc.getBalance())));
+                              }
+                          }));
+
+                  plugin.registerCommand(new Cmd("givem", "Выдать монеты (оператор)", "/givem <ник> <сумма>", "tpcoins.givem",
+                          (sender, a) -> {
+                              if (a.length < 2) {
+                                  sender.sendMessage(m.get("usage", "usage", "/givem <ник> <сумма>"));
+                                  return;
+                              }
+                              long amount = Players.parseAmount(a[1]);
+                              if (amount <= 0) {
+                                  sender.sendMessage(m.get("invalid-amount"));
+                                  return;
+                              }
+                              long limit = Math.max(1, plugin.getConfig().getInt("givem-max", 10000000));
+                              if (amount > limit) {
+                                  sender.sendMessage(m.get("givem-limit", "limit", String.valueOf(limit)));
+                                  return;
+                              }
+                              String key = Players.norm(a[0]);
+                              Result r = eco.deposit(key, amount, "выдано оператором " + sender.getName());
+                              String name = eco.getName(key);
+                              if (r == Result.OK) {
+                                  String amt = String.valueOf(amount);
+                                  String bal = String.valueOf(eco.getBalance(key));
+                                  sender.sendMessage(m.get("givem-ok", "player", name, "amount", amt, "balance", bal));
+                                  Player target = Players.findExact(plugin.getServer(), key);
+                                  if (target != null) {
+                                      target.sendMessage(m.get("givem-received", "amount", amt, "balance", bal));
+                                  }
+                              } else if (r == Result.OVER_LIMIT) {
+                                  sender.sendMessage(m.get("givem-target-limit", "player", name,
+                                          "room", String.valueOf(eco.getRoom(key))));
+                              } else {
+                                  sender.sendMessage(m.get("no-account"));
+                              }
+                          }));
+
+                  plugin.registerCommand(new Cmd("dellm", "Удалить монеты у игрока (оператор)", "/dellm <ник> <сумма>",
+                          "tpcoins.dellm", (sender, a) -> {
+                              if (a.length < 2) {
+                                  sender.sendMessage(m.get("usage", "usage", "/dellm <ник> <сумма>"));
+                                  return;
+                              }
+                              long amount = Players.parseAmount(a[1]);
+                              if (amount <= 0) {
+                                  sender.sendMessage(m.get("invalid-amount"));
+                                  return;
+                              }
+                              String key = Players.norm(a[0]);
+                              long removed = eco.withdrawUpTo(key, amount, "удалено оператором " + sender.getName());
+                              if (removed < 0) {
+                                  sender.sendMessage(m.get("no-account"));
+                                  return;
+                              }
+                              String bal = String.valueOf(eco.getBalance(key));
+                              sender.sendMessage(m.get("dellm-ok", "player", eco.getName(key),
+                                      "amount", String.valueOf(removed), "balance", bal));
+                              if (removed < amount) {
+                                  sender.sendMessage(m.get("dellm-clamped"));
+                              }
+                              Player target = Players.findExact(plugin.getServer(), key);
+                              if (target != null && removed > 0) {
+                                  target.sendMessage(m.get("dellm-lost", "amount", String.valueOf(removed), "balance", bal));
+                              }
+                          }));
+
+                  plugin.registerCommand(new Cmd("chekm", "Посмотреть баланс игрока", "/chekm <ник>", "tpcoins.chekm",
+                          (sender, a) -> {
+                              if (a.length < 1) {
+                                  sender.sendMessage(m.get("usage", "usage", "/chekm <ник>"));
+                                  return;
+                              }
+                              String key = Players.norm(a[0]);
+                              if (!eco.hasAccount(key)) {
+                                  sender.sendMessage(m.get("no-account"));
+                                  return;
+                              }
+                              sender.sendMessage(m.get("chekm-result", "player", eco.getName(key),
+                                      "amount", String.valueOf(eco.getBalance(key))));
+                          }));
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/command/TeleportCommands.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/command/TeleportCommands.java' << 'TPCOINS_EOF'
+          package tpcoins.command;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.math.Vector3;
+          import tpcoins.TpCoins;
+          import tpcoins.util.Messages;
+          import tpcoins.util.Players;
+
+          /** /tpa /tpc /tph /tp /tpk */
+          public final class TeleportCommands {
+              private static final double MAX_XZ = 30_000_000;
+              private static final double MIN_Y = -64;
+              private static final double MAX_Y = 320;
+
+              private TeleportCommands() {
+              }
+
+              public static void register(TpCoins plugin) {
+                  final Messages m = plugin.getMessages();
+
+                  plugin.registerCommand(new Cmd("tpa", "Запрос на телепорт к игроку", "/tpa <ник>", "tpcoins.tpa",
+                          (sender, a) -> {
+                              Player p = playerOnly(sender, m);
+                              if (p == null) {
+                                  return;
+                              }
+                              if (a.length < 1) {
+                                  sender.sendMessage(m.get("usage", "usage", "/tpa <ник>"));
+                                  return;
+                              }
+                              Player target = Players.find(plugin.getServer(), a[0]);
+                              if (target == null) {
+                                  sender.sendMessage(m.get("player-not-found"));
+                                  return;
+                              }
+                              if (target == p) {
+                                  sender.sendMessage(m.get("tpa-self"));
+                                  return;
+                              }
+                              plugin.getTeleports().send(p, target);
+                              String sec = String.valueOf(plugin.getTeleports().timeoutSeconds());
+                              p.sendMessage(m.get("tpa-sent", "player", target.getName(), "seconds", sec));
+                              target.sendMessage(m.get("tpa-received", "player", p.getName(), "seconds", sec));
+                          }));
+
+                  plugin.registerCommand(new Cmd("tpc", "Принять запрос на телепорт", "/tpc [ник]", "tpcoins.tpa",
+                          (sender, a) -> {
+                              Player p = playerOnly(sender, m);
+                              if (p == null) {
+                                  return;
+                              }
+                              Player from = plugin.getTeleports().take(p, a.length > 0 ? a[0] : null);
+                              if (from == null) {
+                                  p.sendMessage(m.get("tpc-none"));
+                                  return;
+                              }
+                              from.teleport(p.getLocation());
+                              p.sendMessage(m.get("tpc-accepted", "player", from.getName()));
+                              from.sendMessage(m.get("tpc-accepted-sender", "player", p.getName()));
+                          }));
+
+                  plugin.registerCommand(new Cmd("tph", "Отклонить запрос на телепорт", "/tph [ник]", "tpcoins.tpa",
+                          (sender, a) -> {
+                              Player p = playerOnly(sender, m);
+                              if (p == null) {
+                                  return;
+                              }
+                              Player from = plugin.getTeleports().take(p, a.length > 0 ? a[0] : null);
+                              if (from == null) {
+                                  p.sendMessage(m.get("tph-none"));
+                                  return;
+                              }
+                              p.sendMessage(m.get("tph-declined", "player", from.getName()));
+                              from.sendMessage(m.get("tph-declined-sender", "player", p.getName()));
+                          }));
+
+                  plugin.registerCommand(new Cmd("tp", "Телепорт к игроку без запроса", "/tp <ник> [ник2]", "tpcoins.tp",
+                          (sender, a) -> {
+                              if (a.length == 1) {
+                                  Player p = playerOnly(sender, m);
+                                  if (p == null) {
+                                      return;
+                                  }
+                                  Player target = Players.find(plugin.getServer(), a[0]);
+                                  if (target == null) {
+                                      sender.sendMessage(m.get("player-not-found"));
+                                      return;
+                                  }
+                                  p.teleport(target.getLocation());
+                                  p.sendMessage(m.get("tp-done", "player", target.getName()));
+                              } else if (a.length >= 2) {
+                                  Player who = Players.find(plugin.getServer(), a[0]);
+                                  Player target = Players.find(plugin.getServer(), a[1]);
+                                  if (who == null || target == null) {
+                                      sender.sendMessage(m.get("player-not-found"));
+                                      return;
+                                  }
+                                  who.teleport(target.getLocation());
+                                  sender.sendMessage(m.get("tp-done-other", "player", who.getName(), "target", target.getName()));
+                              } else {
+                                  sender.sendMessage(m.get("usage", "usage", "/tp <ник> [ник2]"));
+                              }
+                          }));
+
+                  plugin.registerCommand(new Cmd("tpk", "Телепорт по координатам", "/tpk <x> <y> <z>", "tpcoins.tpk",
+                          (sender, a) -> {
+                              Player p = playerOnly(sender, m);
+                              if (p == null) {
+                                  return;
+                              }
+                              if (a.length < 3) {
+                                  sender.sendMessage(m.get("usage", "usage", "/tpk <x> <y> <z>"));
+                                  return;
+                              }
+                              try {
+                                  double x = coord(a[0], p.getX(), true);
+                                  double y = coord(a[1], p.getY(), false);
+                                  double z = coord(a[2], p.getZ(), true);
+                                  if (Math.abs(x) > MAX_XZ || Math.abs(z) > MAX_XZ || y < MIN_Y || y > MAX_Y) {
+                                      throw new NumberFormatException("range");
+                                  }
+                                  p.teleport(new Vector3(x, y, z));
+                                  p.sendMessage(m.get("tpk-done", "x", fmt(x), "y", fmt(y), "z", fmt(z)));
+                              } catch (NumberFormatException e) {
+                                  sender.sendMessage(m.get("tpk-invalid"));
+                              }
+                          }));
+              }
+
+              private static Player playerOnly(CommandSender sender, Messages m) {
+                  if (sender instanceof Player) {
+                      return (Player) sender;
+                  }
+                  sender.sendMessage(m.get("only-player"));
+                  return null;
+              }
+
+              /** "100", "-20.5", "~", "~5". Целые x/z центрируются на блок (+0.5). */
+              private static double coord(String s, double base, boolean center) {
+                  double v;
+                  if (s.startsWith("~")) {
+                      v = base + (s.length() == 1 ? 0 : Double.parseDouble(s.substring(1)));
+                  } else {
+                      v = Double.parseDouble(s);
+                      if (center && !s.contains(".")) {
+                          v += 0.5;
+                      }
+                  }
+                  if (Double.isNaN(v) || Double.isInfinite(v)) {
+                      throw new NumberFormatException("nan");
+                  }
+                  return v;
+              }
+
+              private static String fmt(double v) {
+                  return String.format(java.util.Locale.ROOT, "%.1f", v);
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/economy/EconomyManager.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/economy/EconomyManager.java' << 'TPCOINS_EOF'
+          package tpcoins.economy;
+
+          import cn.nukkit.Player;
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+          import tpcoins.TpCoins;
+          import tpcoins.util.Players;
+
+          import java.io.File;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.lang.reflect.Type;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.AtomicMoveNotSupportedException;
+          import java.nio.file.Files;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          /**
+           * Ядро экономики. Публичный API для других плагинов (например, /shop):
+           *
+           *   EconomyManager eco = ((TpCoins) getServer().getPluginManager().getPlugin("TpCoins")).getEconomy();
+           *   eco.withdraw(Players.norm(player.getName()), 500, "покупка в /shop");
+           *
+           * Аккаунты хранятся по ключу-нику (см. Players.norm) в plugins/TpCoins/balances.json.
+           * Баланс никогда не уходит ниже 0 и выше max-balance. Каждая операция пишется в лог.
+           */
+          public final class EconomyManager {
+
+              public enum Result { OK, NO_ACCOUNT, INVALID_AMOUNT, NOT_ENOUGH, OVER_LIMIT, SAME_ACCOUNT }
+
+              public static final class Account {
+                  private String name;
+                  private long balance;
+
+                  public Account() {
+                  }
+
+                  Account(String name, long balance) {
+                      this.name = name;
+                      this.balance = balance;
+                  }
+
+                  public String getName() {
+                      return name;
+                  }
+
+                  public long getBalance() {
+                      return balance;
+                  }
+              }
+
+              private static final Type MAP_TYPE = new TypeToken<Map<String, Account>>() { }.getType();
+
+              private final TpCoins plugin;
+              private final File file;
+              private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+              private final Map<String, Account> accounts = new HashMap<>();
+              private final MoneyLog log;
+              private final long maxBalance;
+              private final long startBalance;
+
+              public EconomyManager(TpCoins plugin) {
+                  this.plugin = plugin;
+                  this.file = new File(plugin.getDataFolder(), "balances.json");
+                  this.maxBalance = Math.max(1, plugin.getConfig().getInt("max-balance", 10000000));
+                  this.startBalance = Math.max(0, Math.min(maxBalance, plugin.getConfig().getInt("start-balance", 0)));
+                  this.log = new MoneyLog(plugin, plugin.getConfig().getInt("log-keep-days", 30));
+                  load();
+              }
+
+              // ---------- чтение ----------
+
+              public long getMaxBalance() {
+                  return maxBalance;
+              }
+
+              public synchronized boolean hasAccount(String key) {
+                  return accounts.containsKey(key);
+              }
+
+              /** Баланс игрока, 0 если аккаунта нет. */
+              public synchronized long getBalance(String key) {
+                  Account a = accounts.get(key);
+                  return a == null ? 0 : a.balance;
+              }
+
+              /** Ник с оригинальным регистром (или сам ключ, если аккаунта нет). */
+              public synchronized String getName(String key) {
+                  Account a = accounts.get(key);
+                  return a == null ? key : a.name;
+              }
+
+              /** Сколько ещё монет поместится на балансе. */
+              public synchronized long getRoom(String key) {
+                  return maxBalance - getBalance(key);
+              }
+
+              public synchronized List<Account> top(int n) {
+                  List<Account> list = new ArrayList<>(accounts.values());
+                  list.removeIf(a -> a.balance <= 0);
+                  list.sort(Comparator.comparingLong((Account a) -> a.balance).reversed());
+                  return new ArrayList<>(list.subList(0, Math.min(n, list.size())));
+              }
+
+              // ---------- аккаунты ----------
+
+              public synchronized void ensureAccount(Player player) {
+                  String key = Players.norm(player.getName());
+                  Account a = accounts.get(key);
+                  if (a == null) {
+                      accounts.put(key, new Account(player.getName(), startBalance));
+                      save();
+                  } else if (!player.getName().equals(a.name)) {
+                      a.name = player.getName();
+                      save();
+                  }
+              }
+
+              // ---------- операции ----------
+
+              public synchronized Result deposit(String key, long amount, String reason) {
+                  if (amount <= 0) {
+                      return Result.INVALID_AMOUNT;
+                  }
+                  Account a = accounts.get(key);
+                  if (a == null) {
+                      return Result.NO_ACCOUNT;
+                  }
+                  if (a.balance + amount > maxBalance) {
+                      return Result.OVER_LIMIT;
+                  }
+                  a.balance += amount;
+                  save();
+                  record(key, "получил " + amount + suffix(reason));
+                  return Result.OK;
+              }
+
+              public synchronized Result withdraw(String key, long amount, String reason) {
+                  if (amount <= 0) {
+                      return Result.INVALID_AMOUNT;
+                  }
+                  Account a = accounts.get(key);
+                  if (a == null) {
+                      return Result.NO_ACCOUNT;
+                  }
+                  if (a.balance < amount) {
+                      return Result.NOT_ENOUGH;
+                  }
+                  a.balance -= amount;
+                  save();
+                  record(key, "потерял " + amount + suffix(reason));
+                  return Result.OK;
+              }
+
+              /**
+               * Снять до amount монет: если на балансе меньше - снимется всё (баланс 0, не ниже).
+               * Возвращает сколько реально снято, -1 если аккаунта нет.
+               */
+              public synchronized long withdrawUpTo(String key, long amount, String reason) {
+                  Account a = accounts.get(key);
+                  if (a == null || amount <= 0) {
+                      return -1;
+                  }
+                  long taken = Math.min(a.balance, amount);
+                  if (taken > 0) {
+                      a.balance -= taken;
+                      save();
+                      String extra = taken < amount ? ", запрошено " + amount : "";
+                      record(key, "потерял " + taken + suffix(reason + extra));
+                  }
+                  return taken;
+              }
+
+              public synchronized Result transfer(String fromKey, String toKey, long amount) {
+                  if (amount <= 0) {
+                      return Result.INVALID_AMOUNT;
+                  }
+                  if (fromKey.equals(toKey)) {
+                      return Result.SAME_ACCOUNT;
+                  }
+                  Account from = accounts.get(fromKey);
+                  Account to = accounts.get(toKey);
+                  if (from == null || to == null) {
+                      return Result.NO_ACCOUNT;
+                  }
+                  if (from.balance < amount) {
+                      return Result.NOT_ENOUGH;
+                  }
+                  if (to.balance + amount > maxBalance) {
+                      return Result.OVER_LIMIT;
+                  }
+                  from.balance -= amount;
+                  to.balance += amount;
+                  save();
+                  record(fromKey, "перевел " + amount + " игроку " + to.name);
+                  record(toKey, "получил " + amount + " от " + from.name + " (перевод)");
+                  return Result.OK;
+              }
+
+              // ---------- внутреннее ----------
+
+              private static String suffix(String reason) {
+                  return reason == null || reason.isEmpty() ? "" : " (" + reason + ")";
+              }
+
+              private void record(String key, String action) {
+                  Account a = accounts.get(key);
+                  Player online = Players.findExact(plugin.getServer(), key);
+                  log.write(a == null ? key : a.name, Players.coords(online), action);
+              }
+
+              private void load() {
+                  if (!file.exists()) {
+                      return;
+                  }
+                  try (Reader r = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
+                      Map<String, Account> data = gson.fromJson(r, MAP_TYPE);
+                      if (data != null) {
+                          accounts.putAll(data);
+                      }
+                  } catch (Exception e) {
+                      File backup = new File(plugin.getDataFolder(), "balances.json.broken-" + System.currentTimeMillis());
+                      plugin.getLogger().error("balances.json повреждён (" + e.getMessage()
+                              + "). Копия: " + backup.getName() + ". Начинаю с пустой базы!");
+                      try {
+                          Files.copy(file.toPath(), backup.toPath());
+                      } catch (IOException ignored) {
+                          // нечего делать
+                      }
+                      accounts.clear();
+                  }
+              }
+
+              public synchronized void save() {
+                  File dir = file.getParentFile();
+                  if (dir != null) {
+                      dir.mkdirs();
+                  }
+                  File tmp = new File(plugin.getDataFolder(), "balances.json.tmp");
+                  try (Writer w = Files.newBufferedWriter(tmp.toPath(), StandardCharsets.UTF_8)) {
+                      gson.toJson(accounts, MAP_TYPE, w);
+                  } catch (IOException e) {
+                      plugin.getLogger().error("Не удалось сохранить balances.json: " + e.getMessage());
+                      return;
+                  }
+                  try {
+                      Files.move(tmp.toPath(), file.toPath(),
+                              StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                  } catch (AtomicMoveNotSupportedException e) {
+                      try {
+                          Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                      } catch (IOException e2) {
+                          plugin.getLogger().error("Не удалось сохранить balances.json: " + e2.getMessage());
+                      }
+                  } catch (IOException e) {
+                      plugin.getLogger().error("Не удалось сохранить balances.json: " + e.getMessage());
+                  }
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/economy/MoneyLog.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/economy/MoneyLog.java' << 'TPCOINS_EOF'
+          package tpcoins.economy;
+
+          import tpcoins.TpCoins;
+
+          import java.io.File;
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.StandardOpenOption;
+          import java.time.LocalDate;
+          import java.time.LocalDateTime;
+          import java.time.format.DateTimeFormatter;
+
+          /**
+           * Лог денег: plugins/TpCoins/logs/money-ГГГГ-ММ-ДД.log (по файлу на день).
+           * Файлы старше log-keep-days дней удаляются сами.
+           * Строка: [время] Ник | x y z (мир) | получил/потерял/перевел ...
+           */
+          public final class MoneyLog {
+              private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+              private static final String PREFIX = "money-";
+              private static final String SUFFIX = ".log";
+
+              private final TpCoins plugin;
+              private final File dir;
+              private final int keepDays;
+              private LocalDate lastCleanup;
+
+              public MoneyLog(TpCoins plugin, int keepDays) {
+                  this.plugin = plugin;
+                  this.keepDays = Math.max(1, keepDays);
+                  this.dir = new File(plugin.getDataFolder(), "logs");
+                  this.dir.mkdirs();
+                  cleanup();
+              }
+
+              public synchronized void write(String nick, String coords, String action) {
+                  LocalDateTime now = LocalDateTime.now();
+                  if (!now.toLocalDate().equals(lastCleanup)) {
+                      cleanup();
+                  }
+                  String line = "[" + TIME.format(now) + "] " + nick + " | " + coords + " | " + action
+                          + System.lineSeparator();
+                  File file = new File(dir, PREFIX + now.toLocalDate() + SUFFIX);
+                  try {
+                      Files.write(file.toPath(), line.getBytes(StandardCharsets.UTF_8),
+                              StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                  } catch (IOException e) {
+                      plugin.getLogger().warning("Не удалось записать лог денег: " + e.getMessage());
+                  }
+              }
+
+              private void cleanup() {
+                  lastCleanup = LocalDate.now();
+                  LocalDate limit = lastCleanup.minusDays(keepDays);
+                  File[] files = dir.listFiles();
+                  if (files == null) {
+                      return;
+                  }
+                  for (File f : files) {
+                      String n = f.getName();
+                      if (!n.startsWith(PREFIX) || !n.endsWith(SUFFIX)) {
+                          continue;
+                      }
+                      try {
+                          LocalDate d = LocalDate.parse(n.substring(PREFIX.length(), n.length() - SUFFIX.length()));
+                          if (d.isBefore(limit) && !f.delete()) {
+                              plugin.getLogger().warning("Не удалось удалить старый лог " + n);
+                          }
+                      } catch (RuntimeException ignored) {
+                          // чужой файл - не трогаем
+                      }
+                  }
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/teleport/TeleportManager.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/teleport/TeleportManager.java' << 'TPCOINS_EOF'
+          package tpcoins.teleport;
+
+          import cn.nukkit.Player;
+          import tpcoins.TpCoins;
+          import tpcoins.util.Players;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          /** Запросы /tpa: кто кому отправил и до какого времени запрос жив. */
+          public final class TeleportManager {
+
+              private final TpCoins plugin;
+              /** ключ получателя -> (ключ отправителя -> время истечения, мс); порядок = порядок отправки. */
+              private final Map<String, LinkedHashMap<String, Long>> incoming = new HashMap<>();
+
+              public TeleportManager(TpCoins plugin) {
+                  this.plugin = plugin;
+              }
+
+              public int timeoutSeconds() {
+                  return Math.max(5, plugin.getConfig().getInt("tpa-timeout-seconds", 60));
+              }
+
+              public synchronized void send(Player from, Player to) {
+                  LinkedHashMap<String, Long> map =
+                          incoming.computeIfAbsent(Players.norm(to.getName()), k -> new LinkedHashMap<>());
+                  String fromKey = Players.norm(from.getName());
+                  map.remove(fromKey); // повторный запрос уходит в конец очереди
+                  map.put(fromKey, System.currentTimeMillis() + timeoutSeconds() * 1000L);
+              }
+
+              /**
+               * Забрать запрос для target: от senderArg (если указан) или самый свежий.
+               * Возвращает отправителя, который сейчас онлайн, либо null.
+               */
+              public synchronized Player take(Player target, String senderArg) {
+                  String targetKey = Players.norm(target.getName());
+                  LinkedHashMap<String, Long> map = incoming.get(targetKey);
+                  if (map == null) {
+                      return null;
+                  }
+                  long now = System.currentTimeMillis();
+                  map.values().removeIf(expires -> expires < now);
+
+                  String chosen = null;
+                  if (senderArg != null) {
+                      String want = Players.norm(senderArg);
+                      if (map.containsKey(want)) {
+                          chosen = want;
+                      } else {
+                          int count = 0;
+                          for (String k : map.keySet()) {
+                              if (k.startsWith(want)) {
+                                  chosen = k;
+                                  count++;
+                              }
+                          }
+                          if (count != 1) {
+                              chosen = null;
+                          }
+                      }
+                  } else {
+                      List<String> keys = new ArrayList<>(map.keySet());
+                      for (int i = keys.size() - 1; i >= 0 && chosen == null; i--) {
+                          if (Players.findExact(plugin.getServer(), keys.get(i)) != null) {
+                              chosen = keys.get(i);
+                          }
+                      }
+                  }
+                  if (chosen == null) {
+                      return null;
+                  }
+                  map.remove(chosen);
+                  if (map.isEmpty()) {
+                      incoming.remove(targetKey);
+                  }
+                  return Players.findExact(plugin.getServer(), chosen);
+              }
+
+              /** Игрок вышел: убрать запросы к нему и от него. */
+              public synchronized void clear(Player player) {
+                  String key = Players.norm(player.getName());
+                  incoming.remove(key);
+                  for (LinkedHashMap<String, Long> map : incoming.values()) {
+                      map.remove(key);
+                  }
+                  incoming.values().removeIf(Map::isEmpty);
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/util/Messages.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/util/Messages.java' << 'TPCOINS_EOF'
+          package tpcoins.util;
+
+          import cn.nukkit.utils.Config;
+
+          /** Тексты из config.yml (раздел messages). Цвета: & + код. */
+          public final class Messages {
+              private final Config config;
+
+              public Messages(Config config) {
+                  this.config = config;
+              }
+
+              /** get("pay-sent", "player", "Steve", "amount", "100") - пары ключ/значение для {плейсхолдеров}. */
+              public String get(String key, String... pairs) {
+                  String text = config.getString("messages." + key, key);
+                  text = text.replace('&', '\u00a7');
+                  for (int i = 0; i + 1 < pairs.length; i += 2) {
+                      text = text.replace("{" + pairs[i] + "}", pairs[i + 1]);
+                  }
+                  return text;
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/java/tpcoins/util/Players.java')"
+          cat > 'TpCoins/src/main/java/tpcoins/util/Players.java' << 'TPCOINS_EOF'
+          package tpcoins.util;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.Server;
+
+          import java.util.Locale;
+
+          public final class Players {
+              private Players() {
+              }
+
+              /** Ключ ника: нижний регистр, пробелы -> подчёркивания. */
+              public static String norm(String name) {
+                  return name.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
+              }
+
+              /** Точное совпадение (для денег - никаких угадываний по началу ника). */
+              public static Player findExact(Server server, String key) {
+                  for (Player p : server.getOnlinePlayers().values()) {
+                      if (norm(p.getName()).equals(key)) {
+                          return p;
+                      }
+                  }
+                  return null;
+              }
+
+              /** Точное совпадение или единственный игрок, ник которого начинается с введённого. */
+              public static Player find(Server server, String input) {
+                  String key = norm(input);
+                  Player prefix = null;
+                  int count = 0;
+                  for (Player p : server.getOnlinePlayers().values()) {
+                      String n = norm(p.getName());
+                      if (n.equals(key)) {
+                          return p;
+                      }
+                      if (n.startsWith(key)) {
+                          prefix = p;
+                          count++;
+                      }
+                  }
+                  return count == 1 ? prefix : null;
+              }
+
+              /** "x y z (мир)" для лога. */
+              public static String coords(Player p) {
+                  if (p == null) {
+                      return "оффлайн";
+                  }
+                  String level = p.getLevel() == null ? "?" : p.getLevel().getName();
+                  return p.getFloorX() + " " + p.getFloorY() + " " + p.getFloorZ() + " (" + level + ")";
+              }
+
+              /** Целое положительное число до 12 цифр, иначе -1. */
+              public static long parseAmount(String s) {
+                  if (s == null || !s.matches("\\d{1,12}")) {
+                      return -1;
+                  }
+                  long v = Long.parseLong(s);
+                  return v > 0 ? v : -1;
+              }
+          }
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/resources/config.yml')"
+          cat > 'TpCoins/src/main/resources/config.yml' << 'TPCOINS_EOF'
+          # TpCoins config. Цвета: & + код (&a, &c, &e ...)
+          # После обновления плагина удали старый config.yml, чтобы появились новые ключи.
+
+          # Максимум монет на балансе одного игрока
+          max-balance: 10000000
+          # Сколько монет получает новый игрок
+          start-balance: 0
+          # Максимум, который можно выдать одной командой /givem
+          givem-max: 10000000
+          # Сколько игроков показывать в /topm
+          top-size: 10
+          # Сколько дней хранить логи денег (plugins/TpCoins/logs/)
+          log-keep-days: 30
+          # Сколько секунд живёт запрос /tpa
+          tpa-timeout-seconds: 60
+
+          messages:
+            only-player: "&cЭта команда только для игроков."
+            usage: "&eИспользование: {usage}"
+            player-not-found: "&cИгрок не найден онлайн."
+            no-account: "&cИгрок не найден (он должен хоть раз зайти на сервер)."
+            invalid-amount: "&cСумма должна быть целым числом больше 0."
+
+            tpa-self: "&cНельзя отправить запрос самому себе."
+            tpa-sent: "&aЗапрос на телепорт отправлен игроку {player}. Действует {seconds} сек."
+            tpa-received: "&e{player} хочет телепортироваться к тебе. &a/tpc &7- принять, &c/tph &7- отклонить ({seconds} сек)."
+            tpc-none: "&cНет активных запросов на телепорт."
+            tpc-accepted: "&aТы принял запрос от {player}."
+            tpc-accepted-sender: "&a{player} принял запрос. Телепортация!"
+            tph-none: "&cНет активных запросов на телепорт."
+            tph-declined: "&eТы отклонил запрос от {player}."
+            tph-declined-sender: "&c{player} отклонил твой запрос."
+
+            tp-done: "&aТелепорт к {player}."
+            tp-done-other: "&aИгрок {player} телепортирован к {target}."
+            tpk-done: "&aТелепорт на координаты {x} {y} {z}."
+            tpk-invalid: "&cНеверные координаты. Пример: /tpk 100 64 -200 (можно ~ для относительных)."
+
+            pay-self: "&cНельзя переводить монеты самому себе."
+            pay-not-enough: "&cНедостаточно монет."
+            pay-target-limit: "&cУ {player} на балансе не поместится столько монет (можно принять ещё {room})."
+            pay-sent: "&aТы перевёл {amount} монет игроку {player}. Баланс: {balance}."
+            pay-received: "&a{player} перевёл тебе {amount} монет. Баланс: {balance}."
+
+            top-header: "&6=== Самые богатые игроки ==="
+            top-line: "&e{n}. &f{player} &7- &a{amount}"
+            top-empty: "&7Пока никого нет."
+
+            givem-limit: "&cЗа один раз можно выдать не больше {limit} монет."
+            givem-target-limit: "&cУ {player} не поместится столько монет (можно выдать ещё {room})."
+            givem-ok: "&aВыдано {amount} монет игроку {player}. Баланс: {balance}."
+            givem-received: "&aТебе выдали {amount} монет. Баланс: {balance}."
+
+            dellm-ok: "&aУ игрока {player} удалено {amount} монет. Баланс: {balance}."
+            dellm-clamped: "&eНа балансе было меньше, чем запрошено - баланс теперь 0."
+            dellm-lost: "&cС твоего баланса удалено {amount} монет. Баланс: {balance}."
+
+            chekm-result: "&aБаланс {player}: {amount} монет."
+          TPCOINS_EOF
+          mkdir -p "$(dirname 'TpCoins/src/main/resources/plugin.yml')"
+          cat > 'TpCoins/src/main/resources/plugin.yml' << 'TPCOINS_EOF'
+          name: TpCoins
+          main: tpcoins.TpCoins
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: jaryshak
+          description: Teleport requests (/tpa) and a coins economy skeleton (/pay, /topm, ...)
+
+          permissions:
+            tpcoins.tpa:
+              description: Send teleport requests and answer them (/tpa, /tpc, /tph)
+              default: "true"
+            tpcoins.tp:
+              description: Teleport to a player without asking (/tp)
+              default: op
+            tpcoins.tpk:
+              description: Teleport to coordinates (/tpk)
+              default: op
+            tpcoins.pay:
+              description: Pay coins to another player (/pay)
+              default: "true"
+            tpcoins.topm:
+              description: Show richest players (/topm)
+              default: "true"
+            tpcoins.givem:
+              description: Give coins from nowhere (/givem)
+              default: op
+            tpcoins.dellm:
+              description: Remove coins from a player (/dellm)
+              default: op
+            tpcoins.chekm:
+              description: Check another player's balance (/chekm). Nobody by default - grant via LuckPerms
+              default: "false"
+          TPCOINS_EOF
+      - name: Build
+        run: mvn -B clean package
+        working-directory: TpCoins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TpCoins-jar
+          path: TpCoins/target/TpCoins-1.0.0.jar
